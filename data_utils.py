@@ -256,8 +256,37 @@ class BalancedBatchSampler(Sampler):
         random.shuffle(order)
 
         for i in order:
-            idxs = self.buckets[i].copy()
-            random.shuffle(idxs)
+            bucket = self.buckets[i]
 
-            for s in range(0, len(idxs), self.batch_size):
-                yield idxs[s:s + self.batch_size]
+            remaining = len(bucket)
+            swaps = {}
+
+            while remaining > 0:
+                batch = []
+
+                batch_size = min(
+                    self.batch_size,
+                    remaining
+                )
+
+                for _ in range(batch_size):
+                    j = random.randrange(remaining)
+
+                    real_j = swaps.get(j, j)
+
+                    last_pos = remaining - 1
+                    real_last = swaps.get(
+                        last_pos,
+                        last_pos
+                    )
+
+                    swaps[j] = real_last
+                    swaps.pop(last_pos, None)
+
+                    batch.append(
+                        bucket[real_j]
+                    )
+
+                    remaining -= 1
+
+                yield batch
