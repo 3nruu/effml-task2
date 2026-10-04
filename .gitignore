@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+data/
+
+*.pt
+*.pth
+*.ckpt
+
+trace*.json
+
+.venv/
+venv/
