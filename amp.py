@@ -90,7 +90,7 @@ class Autocast:
             ### YOUR CODE HERE
             setattr(module, func_name, wrapped_func)
 
-            return self
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """

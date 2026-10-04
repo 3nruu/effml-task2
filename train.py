@@ -4,6 +4,7 @@ import numpy as np
 import random
 from tqdm.auto import tqdm
 from typing import Callable
+import time
 
 from argparse import ArgumentParser
 
@@ -132,9 +133,16 @@ def train_epoch(
     device: torch.device,
     kind: str,
     scaler: None | amp.StaticGradScaler | amp.DynamicGradScaler,
-) -> None:
+):
     model.train()
     pbar = tqdm(enumerate(train_loader))
+
+    loss_sum = torch.zeros((), device=device)
+    accuracy_sum = torch.zeros((), device=device)
+    num_batches = 0
+
+    grad_events = []
+
     for i, data in pbar:
         tokens, tokens_lens, attention_mask = data['tokens'].to(device), data['lengthes'], data['attention_mask']
         loss_mask = data.get('loss_mask')
@@ -147,9 +155,7 @@ def train_epoch(
         # Pass loss_mask to the criterion for sequenced batches.
         ### YOUR CODE HERE
 
-        if kind == 'fp16' or kind == 'fp32':
-            # compute grads without scaling
-            ### YOUR CODE HERE
+        if kind == 'static' or kind == 'dynamic':
             with amp.Autocast(enabled=True, dtype=torch.float16):
                 outputs = model(tokens, attention_mask)
                 loss = criterion(
@@ -159,8 +165,6 @@ def train_epoch(
                     loss_mask=loss_mask
                 )
         else:
-            # compute grads with scaling
-            ### YOUR CODE HERE
             outputs = model(tokens, attention_mask)
             loss = criterion(
                 outputs,
@@ -169,10 +173,63 @@ def train_epoch(
                 loss_mask=loss_mask
             )
 
+
+        if kind == 'fp16' or kind == 'fp32':
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            loss.backward()
+            end_event.record()
+            grad_events.append((start_event, end_event))
+            optimizer.step()
+        else:
+            scaled_loss = scaler.scale(loss)
+
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+
+            start_event.record()
+
+            scaled_loss.backward()
+
+            end_event.record()
+
+            grad_events.append((start_event, end_event))
+
+            scaler.step(optimizer)
+            scaler.update()
+
         accuracy = metric(outputs, tokens, tokens_lens, loss_mask=loss_mask)
+        loss_sum += loss.detach().float()
+        accuracy_sum += accuracy.detach().float()
+        num_batches += 1
 
         pbar.set_description(f"Loss: {round(loss.item(), 4)} " f"Accuracy: {round(accuracy.item() * 100, 4)}")
 
+    torch.cuda.synchronize()
+
+    grad_times = [
+        start.elapsed_time(end)
+        for start, end in grad_events
+    ]
+
+    avg_grad_time_ms = (
+        sum(grad_times) / len(grad_times)
+    )
+
+    avg_loss = (
+        loss_sum / num_batches
+    ).item()
+
+    avg_accuracy = (
+        accuracy_sum / num_batches
+    ).item()
+
+    return {
+        "loss": avg_loss,
+        "accuracy": avg_accuracy,
+        "grad_time_ms": avg_grad_time_ms,
+    }
 def parse_args():
     parser = ArgumentParser(description="Training Acceleration Task")
     parser.add_argument("--kind", choices=["fp32", "fp16", "static", "dynamic"], default="fp32", help="Training kind (dtype and scaler)")
@@ -195,7 +252,11 @@ def train():
     set_global_seed(42)
     args = parse_args()
     device = torch.device("cuda:0")
+
+    prep_start = time.perf_counter()
     dataloader = get_dataloader(args.dataloader, args.batch_size, args.path, args.k)
+    prep_time = time.perf_counter() - prep_start
+
     model = get_gpt2_model(dataloader.dataset.tokenizer.vocab_size).to(device)
     if args.kind == 'fp16':
         model = model.half()
@@ -217,18 +278,70 @@ def train():
             min_scale=args.min_scale,
             max_scale=args.max_scale
         )
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+
+    torch.cuda.synchronize()
+
+    train_start = time.perf_counter()
+
     num_epochs = args.num_epochs
+
+    result = None
+
     for epoch in range(0, num_epochs):
-        train_epoch(
-            train_loader=dataloader, 
-            model=model, 
-            criterion=criterion, 
+        result = train_epoch(
+            train_loader=dataloader,
+            model=model,
+            criterion=criterion,
             metric=metric,
-            optimizer=optimizer, 
-            device=device, 
-            kind=args.kind, 
+            optimizer=optimizer,
+            device=device,
+            kind=args.kind,
             scaler=scaler
         )
+    torch.cuda.synchronize()
+
+    train_time = (
+        time.perf_counter() - train_start
+    )
+
+    peak_memory_mb = (
+        torch.cuda.max_memory_allocated(device)
+        / 1024**2
+    )
+
+    print()
+    print("========== RESULT ==========")
+
+    print(f"kind={args.kind}")
+    print(f"dataloader={args.dataloader}")
+    print(f"batch_size={args.batch_size}")
+
+    print(f"prep_time_s={prep_time:.6f}")
+    print(f"train_time_s={train_time:.6f}")
+
+    print(
+        f"peak_gpu_memory_mb="
+        f"{peak_memory_mb:.2f}"
+    )
+
+    print(
+        f"loss="
+        f"{result['loss']:.6f}"
+    )
+
+    print(
+        f"accuracy="
+        f"{result['accuracy']:.6f}"
+    )
+
+    print(
+        f"grad_time_ms="
+        f"{result['grad_time_ms']:.6f}"
+    )
+
+    print("============================")
 
 
 if __name__ == '__main__':
